@@ -212,6 +212,14 @@ static void packet_queue_flush(PacketQueue *q) {
 	q->size = 0;
 	SDL_UnlockMutex(q->mutex);
 }
+
+static void packet_queue_destroy(PacketQueue *q)
+{
+	packet_queue_flush(q);
+	SDL_DestroyMutex(q->mutex);
+	SDL_DestroyCond(q->cond);
+}
+
 double get_audio_clock(VideoState *is) {
 	double pts;
 	int hw_buf_size, bytes_per_sec, n;
@@ -794,6 +802,51 @@ int video_thread(void *arg) {
 	av_free(pFrame);
 	return 0;
 }
+
+int stream_component_close(VideoState *is, int stream_index) 
+{
+	AVCodecContext *codecCtx = NULL;
+	AVFormatContext *pFormatCtx = is->pFormatCtx;
+
+	if(stream_index < 0 || stream_index >= pFormatCtx->nb_streams) {
+		return -1;
+	}
+
+	codecCtx = pFormatCtx->streams[stream_index]->codec;
+	switch(codecCtx->codec_type)
+	{
+		case AVMEDIA_TYPE_AUDIO:
+			SDL_CloseAudio();
+
+			packet_queue_flush(&is->audioq);
+			av_free_packet(&is->audio_pkt);
+			swr_free(&is->swr_ctx);
+			av_freep(&is->audio_buf1);
+			is->audio_buf1_size = 0;
+			is->audio_buf = NULL;
+			av_frame_free(&is->frame);
+			break;
+			
+			case AVMEDIA_TYPE_VIDEO:
+			
+				/* note: we also signal this mutex to make sure we deblock the
+					 video thread in all cases */
+				SDL_LockMutex(is->pictq_mutex);
+				SDL_CondSignal(is->pictq_cond);
+				SDL_UnlockMutex(is->pictq_mutex);
+				packet_queue_flush(&is->videoq);
+				
+				SDL_WaitThread(is->video_tid, NULL);
+				break;
+
+		default:
+			break;
+	}
+
+
+
+}
+
 int stream_component_open(VideoState *is, int stream_index) {
 
 	AVFormatContext *pFormatCtx = is->pFormatCtx;
@@ -923,7 +976,7 @@ int decode_thread(void *arg) {
 
 	int video_index = -1;
 	int audio_index = -1;
-	int i;
+	int i, fail_flag = 0;
 
 	is->videoStream=-1;
 	is->audioStream=-1;
@@ -939,15 +992,21 @@ int decode_thread(void *arg) {
 	}
 
 	// Open video file
+	pFormatCtx = avformat_alloc_context();
 	if(avformat_open_input(&pFormatCtx, is->filename, NULL, NULL)!=0)
-		return -1; // Couldn't open file
+	{
+		printf("avformat_open_input: %s\n", is->filename);
+		goto READ_RET;
+	}
 
 	is->pFormatCtx = pFormatCtx;
 
 	// Retrieve stream information
 	if(avformat_find_stream_info(pFormatCtx, NULL)<0)
-		return -1; // Couldn't find stream information
-
+	{
+		printf("avformat_find_stream_info\n");
+		goto READ_RET;
+	}
 	// Dump information about file onto standard error
 	av_dump_format(pFormatCtx, 0, is->filename, 0);
 
@@ -971,7 +1030,7 @@ int decode_thread(void *arg) {
 
 	if(is->videoStream < 0 || is->audioStream < 0) {
 		fprintf(stderr, "%s: could not open codecs\n", is->filename);
-		goto fail;
+		goto READ_RET;
 	}
 
 	// main decode loop
@@ -1016,6 +1075,7 @@ int decode_thread(void *arg) {
 				SDL_Delay(100); /* no error; wait for user input */
 				continue;
 			} else {
+			fail_flag = 1;
 				break;
 			}
 		}
@@ -1032,12 +1092,25 @@ int decode_thread(void *arg) {
 	while(!is->quit) {
 		SDL_Delay(100);
 	}
-fail:
+
+READ_RET:
 	{
-		SDL_Event event;
-		event.type = FF_QUIT_EVENT;
-		event.user.data1 = is;
-		SDL_PushEvent(&event);
+		if (is->audioStream >= 0)
+			stream_component_close(is, is->audioStream);
+		if (is->videoStream >= 0)
+			stream_component_close(is, is->videoStream);
+		if(is->pFormatCtx)
+		{
+			avformat_close_input(&is->pFormatCtx);
+		}
+
+		if(fail_flag)
+		{
+			SDL_Event event;
+			event.type = FF_QUIT_EVENT;
+			event.user.data1 = is;
+			SDL_PushEvent(&event);
+		}
 	}
 	return 0;
 }
@@ -1051,40 +1124,73 @@ void stream_seek(VideoState *is, int64_t pos, int rel) {
 	}
 }
 
-int quit_main(VideoState *is)
+int do_exit(VideoState *is)
 {
-	if(is->audio_buf1)
-	{
-		av_freep(&is->audio_buf1);
-	}
+	int i;
+
+	printf("quit player\n");
+	is->quit = 1;
+	SDL_WaitThread(is->parse_tid, NULL);
 
 	SDL_DestroyMutex(is->pictq_mutex);
 	SDL_DestroyMutex(is->pictq_cond);
 
+
+	/*
+	 * If the video has finished playing, then both the picture and
+	 * audio queues are waiting for more data.  Make them stop
+	 * waiting and terminate normally.
+	 */
+	SDL_CondSignal(is->audioq.cond);
+	SDL_CondSignal(is->videoq.cond);
+
+	packet_queue_destroy(&is->videoq);
+	packet_queue_destroy(&is->audioq);
+
+	for (i = 0; i < VIDEO_PICTURE_QUEUE_SIZE; i++) 
+	{
+		vp = &is->pictq[i];
+		if (vp->bmp) 
+		{
+			SDL_FreeYUVOverlay(vp->bmp);
+			vp->bmp = NULL;
+		}
+	}
+	av_freep(&is);
+
+	SDL_Quit();
+	exit(0);
+}
+
+int quit_main(VideoState *is)
+{
 	if(is)
 	{
-		av_freep(&is);
+			SDL_DestroyMutex(is->pictq_mutex);
+	SDL_DestroyMutex(is->pictq_cond);
+	av_freep(&is);
 	}
+	
+	SDL_Quit();
+	exit(-1);
 }
 
 int main(int argc, char *argv[]) {
 
 	SDL_Event       event;
-	//double          pts;
-	VideoState      *is;
-
-	is = av_mallocz(sizeof(VideoState));
+	VideoState      *is = NULL;
 
 	if(argc < 2) {
 		fprintf(stderr, "Usage: test <file>\n");
-		exit(1);
+		exit(-1);
 	}
+
 	// Register all formats and codecs
 	av_register_all();
 
 	if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER)) {
 		fprintf(stderr, "Could not initialize SDL - %s\n", SDL_GetError());
-		exit(1);
+		exit(-1);
 	}
 
 	// Make a screen to put our video
@@ -1095,7 +1201,14 @@ int main(int argc, char *argv[]) {
 #endif
 	if(!screen) {
 		fprintf(stderr, "SDL: could not set video mode - exiting\n");
-		exit(1);
+		goto MAIN_RET;
+	}
+
+	is = av_mallocz(sizeof(VideoState));
+	if(is == NULL)
+	{
+		printf("av_mallocz error: VideoState\n");
+		goto MAIN_RET;
 	}
 
 	av_strlcpy(is->filename, argv[1], 1024);
@@ -1108,8 +1221,7 @@ int main(int argc, char *argv[]) {
 	is->av_sync_type = DEFAULT_AV_SYNC_TYPE;
 	is->parse_tid = SDL_CreateThread(decode_thread, is);
 	if(!is->parse_tid) {
-		av_free(is);
-		return -1;
+		goto MAIN_RET;
 	}
 
 	av_init_packet(&flush_pkt);
@@ -1146,17 +1258,7 @@ do_seek:
 				break;
 			case FF_QUIT_EVENT:
 			case SDL_QUIT:
-				printf("quit player\n");
-				is->quit = 1;
-				/*
-				 * If the video has finished playing, then both the picture and
-				 * audio queues are waiting for more data.  Make them stop
-				 * waiting and terminate normally.
-				 */
-				SDL_CondSignal(is->audioq.cond);
-				SDL_CondSignal(is->videoq.cond);
-				SDL_Quit();
-				exit(0);
+				do_exit(is);
 				break;
 			case FF_ALLOC_EVENT:
 				alloc_picture(event.user.data1);
@@ -1168,5 +1270,9 @@ do_seek:
 				break;
 		}
 	}
+
+MAIN_RET:
+	quit_main(is);
+
 	return 0;
 }
