@@ -66,7 +66,7 @@ typedef struct AudioParams{
 
 typedef struct VideoState {
 	AVFormatContext *pFormatCtx;
-	int             videoStream, audioStream;
+	int             videoStream, audioStream, subtitleStream;
 
 	int             av_sync_type;
 	double          external_clock; /* external clock base */
@@ -106,10 +106,15 @@ typedef struct VideoState {
 	PacketQueue     videoq;
 	VideoPicture    pictq[VIDEO_PICTURE_QUEUE_SIZE];
 	int             pictq_size, pictq_rindex, pictq_windex;
+	//subtitle
+	PacketQueue     subtitleq;
+	AVStream        *subtitle_st;
+
 	SDL_mutex       *pictq_mutex;
 	SDL_cond        *pictq_cond;
 	SDL_Thread      *parse_tid;
 	SDL_Thread      *video_tid;
+	SDL_Thread      *subtitle_tid;
 
 	char            filename[1024];
 	int             quit;
@@ -523,6 +528,7 @@ void video_display(VideoState *is) {
 		}
 		h = screen->h;
 		w = ((int)rint(h * aspect_ratio)) & -3;
+
 		if(w > screen->w) {
 			w = screen->w;
 			h = ((int)rint(w / aspect_ratio)) & -3;
@@ -755,6 +761,17 @@ void our_release_buffer(struct AVCodecContext *c, AVFrame *pic) {
 	avcodec_default_release_buffer(c, pic);
 }
 
+int subtitle_thread(void *arg)
+{
+	int ret;
+	AVPacket pkt1, *pkt = &pkt1;
+
+	while(1)
+	{
+		ret = packet_queue_get(&is->subtitleq, pkt, 1);
+	}
+}
+
 int video_thread(void *arg) {
 	VideoState *is = (VideoState *)arg;
 	AVPacket pkt1, *packet = &pkt1;
@@ -824,21 +841,23 @@ int stream_component_close(VideoState *is, int stream_index)
 			av_freep(&is->audio_buf1);
 			is->audio_buf1_size = 0;
 			is->audio_buf = NULL;
-			av_frame_free(&is->frame);
 			break;
-			
-			case AVMEDIA_TYPE_VIDEO:
-			
-				/* note: we also signal this mutex to make sure we deblock the
-					 video thread in all cases */
-				SDL_LockMutex(is->pictq_mutex);
-				SDL_CondSignal(is->pictq_cond);
-				SDL_UnlockMutex(is->pictq_mutex);
-				packet_queue_flush(&is->videoq);
-				
-				SDL_WaitThread(is->video_tid, NULL);
-				break;
 
+		case AVMEDIA_TYPE_VIDEO:
+
+			/* note: we also signal this mutex to make sure we deblock the
+			   video thread in all cases */
+			SDL_LockMutex(is->pictq_mutex);
+			SDL_CondSignal(is->pictq_cond);
+			SDL_UnlockMutex(is->pictq_mutex);
+			packet_queue_flush(&is->videoq);
+
+			SDL_WaitThread(is->video_tid, NULL);
+			break;
+
+		case AVMEDIA_TYPE_SUBTITLE:
+			packet_queue_flush(&is->subtitleq);
+			SDL_WaitThread(is->subtitle_tid, NULL);
 		default:
 			break;
 	}
@@ -953,7 +972,12 @@ int stream_component_open(VideoState *is, int stream_index) {
 				);
 			codecCtx->get_buffer = our_get_buffer;
 			codecCtx->release_buffer = our_release_buffer;
-
+			break;
+		case AVMEDIA_TYPE_SUBTITLE:
+			is->subtitleStream = stream_index;
+			is->subtitle_st = pformatCtx->streams[stream_index];
+			packet_queue_init(&is->subtitleq);
+			is->subtitle_tid = SDL_CreateThread(subtitle_thread, is);
 			break;
 		default:
 			break;
@@ -976,6 +1000,7 @@ int decode_thread(void *arg) {
 
 	int video_index = -1;
 	int audio_index = -1;
+	int subtitle_index = -1;
 	int i, fail_flag = 0;
 
 	is->videoStream=-1;
@@ -1020,6 +1045,9 @@ int decode_thread(void *arg) {
 				audio_index < 0) {
 			audio_index=i;
 		}
+		if(pFormatCtx->streams[i]->codec->code_type == AVMEDIA_TYPE_SUBTITLE &&
+				subtitle_index < 0)
+			subtitle_index = i;
 	}
 	if(audio_index >= 0) {
 		stream_component_open(is, audio_index);
@@ -1027,6 +1055,9 @@ int decode_thread(void *arg) {
 	if(video_index >= 0) {
 		stream_component_open(is, video_index);
 	}   
+	if(subtitle_index >= 0){
+		stream_component_open(is, subtitle_index);
+	}
 
 	if(is->videoStream < 0 || is->audioStream < 0) {
 		fprintf(stderr, "%s: could not open codecs\n", is->filename);
@@ -1075,7 +1106,7 @@ int decode_thread(void *arg) {
 				SDL_Delay(100); /* no error; wait for user input */
 				continue;
 			} else {
-			fail_flag = 1;
+				fail_flag = 1;
 				break;
 			}
 		}
@@ -1084,7 +1115,11 @@ int decode_thread(void *arg) {
 			packet_queue_put(&is->videoq, packet);
 		} else if(packet->stream_index == is->audioStream) {
 			packet_queue_put(&is->audioq, packet);
-		} else {
+		} else if(packet->stream_index == is->subtitleStream)
+		{
+			packet_queue_put(&is->subtitleq, packet);
+		}	
+		else {
 			av_free_packet(packet);
 		}
 	}
@@ -1099,6 +1134,8 @@ READ_RET:
 			stream_component_close(is, is->audioStream);
 		if (is->videoStream >= 0)
 			stream_component_close(is, is->videoStream);
+		if (is->subtitleStream >= 0)
+			stream_component_close(is, is->subtitleStream);
 		if(is->pFormatCtx)
 		{
 			avformat_close_input(&is->pFormatCtx);
@@ -1126,6 +1163,7 @@ void stream_seek(VideoState *is, int64_t pos, int rel) {
 
 int do_exit(VideoState *is)
 {
+	VideoPicture *vp;
 	int i;
 
 	printf("quit player\n");
@@ -1166,11 +1204,11 @@ int quit_main(VideoState *is)
 {
 	if(is)
 	{
-			SDL_DestroyMutex(is->pictq_mutex);
-	SDL_DestroyMutex(is->pictq_cond);
-	av_freep(&is);
+		SDL_DestroyMutex(is->pictq_mutex);
+		SDL_DestroyMutex(is->pictq_cond);
+		av_freep(&is);
 	}
-	
+
 	SDL_Quit();
 	exit(-1);
 }
@@ -1194,10 +1232,15 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Make a screen to put our video
+	const SDL_VideoInfo *vi = SDL_GetVideoInfo();
+#if 1 
 #ifndef __DARWIN__
-	screen = SDL_SetVideoMode(640, 480, 0, 0);
+	screen = SDL_SetVideoMode(640, 480, 0, SDL_RESIZABLE);
 #else
-	screen = SDL_SetVideoMode(640, 480, 24, 0);
+	screen = SDL_SetVideoMode(640, 480, 24, SDL_RESIZABLE);
+#endif
+#else
+	screen = SDL_SetVideoMode(vi->current_w, vi->current_h, 0, SDL_FULLSCREEN);
 #endif
 	if(!screen) {
 		fprintf(stderr, "SDL: could not set video mode - exiting\n");
@@ -1252,10 +1295,20 @@ do_seek:
 							stream_seek(global_video_state, (int64_t)(pos * AV_TIME_BASE), incr);
 						}
 						break;
+				//	case SDL_ESC:
+
 					default:
 						break;
 				}
 				break;
+			case SDL_VIDEORESIZE:
+				{
+					printf("resize window 1\n");
+					//screen = SDL_SetVideoMode(event.resize.w, event.resize.h, 24, SDL_RESIZABLE);
+					screen = SDL_SetVideoMode(event.resize.w, event.resize.h, 24, 0);
+					printf("resize over\n");
+					break;
+				}
 			case FF_QUIT_EVENT:
 			case SDL_QUIT:
 				do_exit(is);
