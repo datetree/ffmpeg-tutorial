@@ -11,3 +11,14 @@
 *.la
 *.a
 
+#prj file
+*.IAB
+*.IAD
+*.IMB
+*.IMD
+*.PFI
+*.PO
+*.PR
+*.PRI
+*.PS
+*.WK3

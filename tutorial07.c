@@ -42,6 +42,7 @@
 #define VIDEO_PICTURE_QUEUE_SIZE 1
 #define DEFAULT_AV_SYNC_TYPE AV_SYNC_VIDEO_MASTER
 #define MAX_AUDIO_FRAME_SIZE 192000
+#define SUBPICTURE_QUEUE_SIZE 1
 
 typedef struct PacketQueue {
 	AVPacketList *first_pkt, *last_pkt;
@@ -63,6 +64,12 @@ typedef struct AudioParams{
 	int64_t channel_layout;
 	enum AVSampleFormat fmt;
 }AudioParams;
+
+typedef struct SubPicture {
+    double pts; /* presentation time stamp for this picture */
+    AVSubtitle sub;
+} SubPicture;
+
 
 typedef struct VideoState {
 	AVFormatContext *pFormatCtx;
@@ -109,6 +116,10 @@ typedef struct VideoState {
 	//subtitle
 	PacketQueue     subtitleq;
 	AVStream        *subtitle_st;
+    SubPicture subpq[SUBPICTURE_QUEUE_SIZE];
+	int subpq_size, subpq_rindex, subpq_windex;
+	SDL_mutex *subpq_mutex;
+	SDL_cond *subpq_cond;
 
 	SDL_mutex       *pictq_mutex;
 	SDL_cond        *pictq_cond;
@@ -135,6 +146,234 @@ SDL_Surface     *screen;
    can be global in case we need it. */
 VideoState *global_video_state;
 AVPacket flush_pkt;
+
+#define ALPHA_BLEND(a, oldp, newp, s)\
+((((oldp << s) * (255 - (a))) + (newp * (a))) / (255 << s))
+
+#define RGBA_IN(r, g, b, a, s)\
+{\
+    unsigned int v = ((const uint32_t *)(s))[0];\
+    a = (v >> 24) & 0xff;\
+    r = (v >> 16) & 0xff;\
+    g = (v >> 8) & 0xff;\
+    b = v & 0xff;\
+}
+
+#define YUVA_IN(y, u, v, a, s, pal)\
+{\
+    unsigned int val = ((const uint32_t *)(pal))[*(const uint8_t*)(s)];\
+    a = (val >> 24) & 0xff;\
+    y = (val >> 16) & 0xff;\
+    u = (val >> 8) & 0xff;\
+    v = val & 0xff;\
+}
+
+#define YUVA_OUT(d, y, u, v, a)\
+{\
+    ((uint32_t *)(d))[0] = (a << 24) | (y << 16) | (u << 8) | v;\
+}
+
+#define BPP 1
+
+static void blend_subrect(AVPicture *dst, const AVSubtitleRect *rect, int imgw, int imgh)
+{
+    int wrap, wrap3, width2, skip2;
+    int y, u, v, a, u1, v1, a1, w, h;
+    uint8_t *lum, *cb, *cr;
+    const uint8_t *p;
+    const uint32_t *pal;
+    int dstx, dsty, dstw, dsth;
+
+    dstw = av_clip(rect->w, 0, imgw);
+    dsth = av_clip(rect->h, 0, imgh);
+    dstx = av_clip(rect->x, 0, imgw - dstw);
+    dsty = av_clip(rect->y, 0, imgh - dsth);
+    lum = dst->data[0] + dsty * dst->linesize[0];
+    cb  = dst->data[1] + (dsty >> 1) * dst->linesize[1];
+    cr  = dst->data[2] + (dsty >> 1) * dst->linesize[2];
+
+    width2 = ((dstw + 1) >> 1) + (dstx & ~dstw & 1);
+    skip2 = dstx >> 1;
+    wrap = dst->linesize[0];
+    wrap3 = rect->pict.linesize[0];
+    p = rect->pict.data[0];
+    pal = (const uint32_t *)rect->pict.data[1];  /* Now in YCrCb! */
+
+    if (dsty & 1) {
+        lum += dstx;
+        cb += skip2;
+        cr += skip2;
+
+        if (dstx & 1) {
+            YUVA_IN(y, u, v, a, p, pal);
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a >> 2, cb[0], u, 0);
+            cr[0] = ALPHA_BLEND(a >> 2, cr[0], v, 0);
+            cb++;
+            cr++;
+            lum++;
+            p += BPP;
+        }
+        for (w = dstw - (dstx & 1); w >= 2; w -= 2) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+
+            YUVA_IN(y, u, v, a, p + BPP, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[1] = ALPHA_BLEND(a, lum[1], y, 0);
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u1, 1);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v1, 1);
+            cb++;
+            cr++;
+            p += 2 * BPP;
+            lum += 2;
+        }
+        if (w) {
+            YUVA_IN(y, u, v, a, p, pal);
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a >> 2, cb[0], u, 0);
+            cr[0] = ALPHA_BLEND(a >> 2, cr[0], v, 0);
+            p++;
+            lum++;
+        }
+        p += wrap3 - dstw * BPP;
+        lum += wrap - dstw - dstx;
+        cb += dst->linesize[1] - width2 - skip2;
+        cr += dst->linesize[2] - width2 - skip2;
+    }
+    for (h = dsth - (dsty & 1); h >= 2; h -= 2) {
+        lum += dstx;
+        cb += skip2;
+        cr += skip2;
+
+        if (dstx & 1) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            p += wrap3;
+            lum += wrap;
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u1, 1);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v1, 1);
+            cb++;
+            cr++;
+            p += -wrap3 + BPP;
+            lum += -wrap + 1;
+        }
+        for (w = dstw - (dstx & 1); w >= 2; w -= 2) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+
+            YUVA_IN(y, u, v, a, p + BPP, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[1] = ALPHA_BLEND(a, lum[1], y, 0);
+            p += wrap3;
+            lum += wrap;
+
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+
+            YUVA_IN(y, u, v, a, p + BPP, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[1] = ALPHA_BLEND(a, lum[1], y, 0);
+
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u1, 2);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v1, 2);
+
+            cb++;
+            cr++;
+            p += -wrap3 + 2 * BPP;
+            lum += -wrap + 2;
+        }
+        if (w) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            p += wrap3;
+            lum += wrap;
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u1, 1);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v1, 1);
+            cb++;
+            cr++;
+            p += -wrap3 + BPP;
+            lum += -wrap + 1;
+        }
+        p += wrap3 + (wrap3 - dstw * BPP);
+        lum += wrap + (wrap - dstw - dstx);
+        cb += dst->linesize[1] - width2 - skip2;
+        cr += dst->linesize[2] - width2 - skip2;
+    }
+    /* handle odd height */
+    if (h) {
+        lum += dstx;
+        cb += skip2;
+        cr += skip2;
+
+        if (dstx & 1) {
+            YUVA_IN(y, u, v, a, p, pal);
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a >> 2, cb[0], u, 0);
+            cr[0] = ALPHA_BLEND(a >> 2, cr[0], v, 0);
+            cb++;
+            cr++;
+            lum++;
+            p += BPP;
+        }
+        for (w = dstw - (dstx & 1); w >= 2; w -= 2) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+
+            YUVA_IN(y, u, v, a, p + BPP, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[1] = ALPHA_BLEND(a, lum[1], y, 0);
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u, 1);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v, 1);
+            cb++;
+            cr++;
+            p += 2 * BPP;
+            lum += 2;
+        }
+        if (w) {
+            YUVA_IN(y, u, v, a, p, pal);
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a >> 2, cb[0], u, 0);
+            cr[0] = ALPHA_BLEND(a >> 2, cr[0], v, 0);
+        }
+    }
+}
 
 void packet_queue_init(PacketQueue *q) {
 	memset(q, 0, sizeof(PacketQueue));
@@ -509,13 +748,41 @@ void video_display(VideoState *is) {
 
 	SDL_Rect rect;
 	VideoPicture *vp;
+    SubPicture *sp;
+    AVPicture pict;
 	//AVPicture pict;
 	float aspect_ratio;
 	int w, h, x, y;
 	//int i;
+    int i;
 
 	vp = &is->pictq[is->pictq_rindex];
 	if(vp->bmp) {
+        if (is->subtitle_st) 
+		{
+            if (is->subpq_size > 0) {
+                sp = &is->subpq[is->subpq_rindex];
+
+                if (vp->pts >= sp->pts + ((float) sp->sub.start_display_time / 1000)) {
+                    SDL_LockYUVOverlay (vp->bmp);
+
+                    pict.data[0] = vp->bmp->pixels[0];
+                    pict.data[1] = vp->bmp->pixels[2];
+                    pict.data[2] = vp->bmp->pixels[1];
+
+                    pict.linesize[0] = vp->bmp->pitches[0];
+                    pict.linesize[1] = vp->bmp->pitches[2];
+                    pict.linesize[2] = vp->bmp->pitches[1];
+
+                    for (i = 0; i < sp->sub.num_rects; i++)
+                        blend_subrect(&pict, sp->sub.rects[i],
+                                      vp->bmp->w, vp->bmp->h);
+
+                    SDL_UnlockYUVOverlay (vp->bmp);
+                }
+            }
+        }
+		
 		if(is->video_st->codec->sample_aspect_ratio.num == 0) {
 			aspect_ratio = 0;
 		} else {
@@ -549,6 +816,7 @@ void video_refresh_timer(void *userdata) {
 	VideoState *is = (VideoState *)userdata;
 	VideoPicture *vp;
 	double actual_delay, delay, sync_threshold, ref_clock, diff;
+    SubPicture *sp, *sp2;
 
 	if(is->video_st) {
 		if(is->pictq_size == 0) {
@@ -593,6 +861,30 @@ void video_refresh_timer(void *userdata) {
 				actual_delay = 0.010;
 			}
 			schedule_refresh(is, (int)(actual_delay * 1000 + 0.5));
+
+			if (is->subpq_size > 0) {
+				sp = &is->subpq[is->subpq_rindex];
+
+				if (is->subpq_size > 1)
+					sp2 = &is->subpq[(is->subpq_rindex + 1) % SUBPICTURE_QUEUE_SIZE];
+				else
+					sp2 = NULL;
+
+				if ((is->video_current_pts > (sp->pts + ((float) sp->sub.end_display_time / 1000)))
+						|| (sp2 && is->video_current_pts > (sp2->pts + ((float) sp2->sub.start_display_time / 1000))))
+				{
+					avsubtitle_free(&sp->sub);
+
+					/* update queue size and signal for next picture */
+					if (++is->subpq_rindex == SUBPICTURE_QUEUE_SIZE)
+						is->subpq_rindex = 0;
+
+					SDL_LockMutex(is->subpq_mutex);
+					is->subpq_size--;
+					SDL_CondSignal(is->subpq_cond);
+					SDL_UnlockMutex(is->subpq_mutex);
+				}
+			}
 
 			/* show the picture! */
 			video_display(is);
@@ -763,13 +1055,73 @@ void our_release_buffer(struct AVCodecContext *c, AVFrame *pic) {
 
 int subtitle_thread(void *arg)
 {
-	int ret;
+	VideoState *is = (VideoState *)arg;
+    SubPicture *sp;
+	double pts;
+	int ret, got_subtitle;
 	AVPacket pkt1, *pkt = &pkt1;
+    int i, j;
+    int r, g, b, y, u, v, a;
 
 	while(1)
 	{
 		ret = packet_queue_get(&is->subtitleq, pkt, 1);
+		if(ret < 0)
+			break;
+
+		if(pkt->data == flush_pkt.data)
+		{
+			avcodec_flush_buffers(is->subtitle_st->codec);
+			continue;
+		}
+		
+        SDL_LockMutex(is->subpq_mutex);
+        while (is->subpq_size >= SUBPICTURE_QUEUE_SIZE &&
+               !is->quit) {
+            SDL_CondWait(is->subpq_cond, is->subpq_mutex);
+        }
+        SDL_UnlockMutex(is->subpq_mutex);
+
+		if(is->quit)
+			return 0;
+
+		sp = &is->subpq[is->subpq_windex];
+		pts = 0;
+		if(pkt->pts != AV_NOPTS_VALUE)
+			pts = av_q2d(is->subtitle_st->time_base) * pkt->pts;
+
+		avcodec_decode_subtitle2(is->subtitle_st->codec, &sp->sub, &got_subtitle, pkt);
+		if(got_subtitle && sp->sub.format == 0)
+		{
+			if(sp->sub.pts != AV_NOPTS_VALUE)
+				pts = sp->sub.pts / (double)AV_TIME_BASE;
+			sp->pts = pts;
+
+
+            for (i = 0; i < sp->sub.num_rects; i++)
+            {
+                for (j = 0; j < sp->sub.rects[i]->nb_colors; j++)
+                {
+                    RGBA_IN(r, g, b, a, (uint32_t*)sp->sub.rects[i]->pict.data[1] + j);
+                    y = RGB_TO_Y_CCIR(r, g, b);
+                    u = RGB_TO_U_CCIR(r, g, b, 0);
+                    v = RGB_TO_V_CCIR(r, g, b, 0);
+                    YUVA_OUT((uint32_t*)sp->sub.rects[i]->pict.data[1] + j, y, u, v, a);
+                }
+            }
+			
+            /* now we can update the picture count */
+            if (++is->subpq_windex == SUBPICTURE_QUEUE_SIZE)
+                is->subpq_windex = 0;
+            SDL_LockMutex(is->subpq_mutex);
+            is->subpq_size++;
+            SDL_UnlockMutex(is->subpq_mutex);
+
+		}
+		av_free_packet(pkt);
 	}
+
+	return 0;
 }
 
 int video_thread(void *arg) {
@@ -1205,7 +1557,10 @@ int quit_main(VideoState *is)
 	if(is)
 	{
 		SDL_DestroyMutex(is->pictq_mutex);
-		SDL_DestroyMutex(is->pictq_cond);
+		SDL_DestroyCond(is->pictq_cond);
+
+		SDL_DestroyMutex(is->subpq_mutex);
+		SDL_DestroyCond(is->subpq_mutex);
 		av_freep(&is);
 	}
 
@@ -1258,6 +1613,9 @@ int main(int argc, char *argv[]) {
 
 	is->pictq_mutex = SDL_CreateMutex();
 	is->pictq_cond = SDL_CreateCond();
+
+	is->subpq_mutex = SDL_CreateMutex();
+	is->subpq_cond = SDL_CreateCond();
 
 	schedule_refresh(is, 40);
 
